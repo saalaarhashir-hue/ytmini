@@ -1,0 +1,139 @@
+name: Build YouTube Mini ISO
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: debian:12
+      options: --privileged
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y live-build debootstrap curl ca-certificates \
+            xorriso syslinux syslinux-common isolinux mtools dosfstools \
+            squashfs-tools cpio xz-utils
+
+      - name: Create live-build config
+        run: |
+          mkdir -p /build && cd /build
+          lb config \
+            --distribution bookworm \
+            --architectures i386 \
+            --linux-flavours 686 \
+            --binary-images iso-hybrid \
+            --archive-areas "main contrib non-free non-free-firmware" \
+            --debian-installer none \
+            --apt-recommends false \
+            --memtest none \
+            --bootappend-live "boot=live components quiet username=yt"
+
+          mkdir -p config/package-lists
+          cat > config/package-lists/ytmini.list.chroot <<'EOF'
+          xorg
+          xserver-xorg-video-intel
+          openbox
+          xterm
+          mpv
+          python3
+          quickjs
+          curl
+          ca-certificates
+          zenity
+          unclutter
+          alsa-utils
+          network-manager
+          sudo
+          firmware-misc-nonfree
+          firmware-realtek
+          firmware-atheros
+          firmware-iwlwifi
+          firmware-brcm80211
+          EOF
+
+          SKEL=config/includes.chroot/etc/skel
+          mkdir -p "$SKEL/.config/openbox" config/includes.chroot/etc
+
+          cat > "$SKEL/.profile" <<'EOF'
+          [ -z "$DISPLAY" ] && [ "$(tty)" = "/dev/tty1" ] && exec startx
+          EOF
+
+          cat > "$SKEL/.xinitrc" <<'EOF'
+          xset s off -dpms
+          unclutter -idle 2 &
+          exec openbox-session
+          EOF
+
+          cat > "$SKEL/.config/openbox/autostart" <<'EOF'
+          ~/yt.sh &
+          EOF
+
+          cat > config/includes.chroot/etc/yt-dlp.conf <<'EOF'
+          --js-runtimes quickjs
+          --remote-components ejs:github
+          EOF
+
+          cat > "$SKEL/yt.sh" <<'EOF'
+          #!/bin/bash
+          ( sleep 5; sudo /usr/local/bin/yt-dlp -U >/dev/null 2>&1 ) &
+          while true; do
+            if ! ping -c1 -W3 youtube.com >/dev/null 2>&1; then
+              xterm -fa Monospace -fs 14 -e nmtui
+              continue
+            fi
+            Q=$(zenity --entry --title="YouTube" \
+                --text="Search or paste a link  (Cancel = Wi-Fi settings):" --width=450) || {
+                  xterm -fa Monospace -fs 14 -e nmtui; continue; }
+            [ -z "$Q" ] && continue
+            case "$Q" in
+              http*) URL="$Q" ;;
+              *)     URL="ytdl://ytsearch:$Q" ;;
+            esac
+            mpv --fs \
+              --ytdl-format='bestvideo[height<=480][vcodec^=avc1]+bestaudio[ext=m4a]/best[height<=480][vcodec^=avc1]/best[height<=480]' \
+              --profile=fast --vo=x11 --hwdec=no \
+              --vd-lavc-skiploopfilter=all --vd-lavc-fast \
+              --framedrop=vo --cache=yes --demuxer-max-bytes=40MiB \
+              "$URL"
+          done
+          EOF
+
+          mkdir -p config/hooks/live
+          cat > config/hooks/live/0100-ytdlp.hook.chroot <<'EOF'
+          #!/bin/sh
+          set -e
+          curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
+            -o /usr/local/bin/yt-dlp
+          chmod 755 /usr/local/bin/yt-dlp
+          EOF
+
+          cat > config/hooks/live/0200-perms.hook.chroot <<'EOF'
+          #!/bin/sh
+          chmod +x /etc/skel/yt.sh
+          echo 'yt ALL=(ALL) NOPASSWD: /usr/local/bin/yt-dlp' > /etc/sudoers.d/yt-dlp
+          chmod 440 /etc/sudoers.d/yt-dlp
+          EOF
+          chmod +x config/hooks/live/*.hook.chroot
+
+      - name: Build ISO
+        run: |
+          cd /build
+          lb build
+
+      - name: Collect ISO
+        run: |
+          cd /build
+          ls -lh
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp "$(ls *.iso | head -n1)" "$GITHUB_WORKSPACE/out/ytmini.iso"
+
+      - name: Upload ISO
+        uses: actions/upload-artifact@v4
+        with:
+          name: ytmini-iso
+          path: out/ytmini.iso
+          retention-days: 30
+          compression-level: 0
